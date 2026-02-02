@@ -732,30 +732,136 @@ def compare_multiple_models(analyzers: Dict[str, BTLPPTMAnalyzer],
 
 
 
+def plot_btl(
+    journals,
+    theta_scores,
+    width_per_bar=0.5,
+    height=7,
+    title='',
+    ylabel='θ (Strength Parameter)',
+    save_path=None,
+    dpi=300,
+    min_fontsize=11,
+    show_values=True
+):
+    """
+    Create a vertical bar chart visualization of BTL theta rankings.
+    """
 
-if __name__ == "__main__":
-    # Test analysis functions
-    from data_format import example_dataset
-    from btl_pptm import BTLPPTMAnalyzer
-    
-    print("Testing BTL-PPTM analysis functions...")
-    
-    # Fit model
-    dataset = example_dataset()
-    analyzer = BTLPPTMAnalyzer(n_topics=3, n_hyperwords=50, embed_dim=10)
-    analyzer.fit(dataset, batch_size=2, verbose=False)
-    
-    # Test analysis
-    analysis = BTLPPTMAnalysis(analyzer)
-    rankings = analysis.get_topic_rankings()
-    print(f"✓ Generated {len(rankings)} topic-journal rankings")
-    
-    # Test visualization
-    try:
-        viz = BTLPPTMVisualizer(analyzer)
-        viz.plot_topic_rankings(top_k=3, figsize=(10, 4))
-        print("✓ Visualization test passed")
-    except Exception as e:
-        print(f"⚠ Visualization test failed (normal in headless environments): {e}")
-    
-    print("✓ Analysis module test completed!")
+    # ---------------------------
+    # Figure sizing
+    # ---------------------------
+    n_journals = len(journals)
+    figwidth = max(width_per_bar * n_journals, 12)
+
+    fig, ax = plt.subplots(
+        figsize=(figwidth, height),
+        constrained_layout=True   # <-- CLEAN FIX
+    )
+
+    # ---------------------------
+    # Colors
+    # ---------------------------
+    colors = plt.cm.RdYlBu_r(np.linspace(0.15, 0.85, n_journals))
+
+    # ---------------------------
+    # Bars
+    # ---------------------------
+    x_pos = np.arange(n_journals)
+    bars = ax.bar(
+        x_pos,
+        theta_scores,
+        color=colors,
+        edgecolor='white',
+        linewidth=0.5,
+        width=0.85
+    )
+
+    # ---------------------------
+    # X ticks & labels
+    # ---------------------------
+    ax.set_xticks(x_pos)
+
+    label_fontsize = max(min_fontsize, min(11, 400 / n_journals))
+
+    if n_journals > 50:
+        rotation = 90
+        ha = 'center'
+        va = 'top'
+    else:
+        rotation = 45
+        ha = 'right'
+        va = 'top'
+
+    ax.set_xticklabels(
+        journals,
+        rotation=rotation,
+        ha=ha,
+        va=va,
+        fontsize=label_fontsize
+    )
+
+    # ---------------------------
+    # Labels & title
+    # ---------------------------
+    ax.set_ylabel(ylabel, fontsize=13, fontweight='bold')
+    ax.set_title(title, fontsize=15, fontweight='bold', pad=15)
+
+    # ---------------------------
+    # Reference line & grid
+    # ---------------------------
+    ax.axhline(0, color='black', linewidth=0.8, alpha=0.3)
+    ax.grid(axis='y', linestyle='--', linewidth=0.5, alpha=0.3)
+    ax.set_axisbelow(True)
+
+    # ---------------------------
+    # Value labels
+    # ---------------------------
+    if show_values:
+        if n_journals <= 50:
+            value_fontsize = max(6, min(8, 300 / n_journals))
+            for i, (bar, score) in enumerate(zip(bars, theta_scores)):
+                if score >= 0:
+                    ax.text(
+                        i, score + 0.08, f'{score:.2f}',
+                        ha='center', va='bottom',
+                        fontsize=value_fontsize
+                    )
+                else:
+                    ax.text(
+                        i, score - 0.08, f'{score:.2f}',
+                        ha='center', va='top',
+                        fontsize=value_fontsize
+                    )
+        else:
+            step = max(1, n_journals // 20)
+            for i in range(0, n_journals, step):
+                score = theta_scores[i]
+                ax.text(
+                    i,
+                    score + (0.08 if score >= 0 else -0.08),
+                    f'{score:.2f}',
+                    ha='center',
+                    va='bottom' if score >= 0 else 'top',
+                    fontsize=7
+                )
+
+    # ---------------------------
+    # Aesthetic cleanup
+    # ---------------------------
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    y_min, y_max = min(theta_scores), max(theta_scores)
+    padding = 0.1 * (y_max - y_min)
+    ax.set_ylim(y_min - padding, y_max + padding)
+
+    ax.set_xlim(-0.5, n_journals - 0.5)
+
+    # ---------------------------
+    # Save
+    # ---------------------------
+    if save_path:
+        fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
+
+    return fig, ax
