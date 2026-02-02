@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from sklearn.cluster import MiniBatchKMeans
 from scipy.spatial.distance import cdist
 from scipy.spatial.distance import cdist
-
+import choix
 
 def euc_dist_sq(word_repr1, word_repr2):
   return (
@@ -138,60 +138,6 @@ def get_nearest_point(point_cloud, point):
   return np.argmin(np.linalg.norm(point_cloud - point, axis=1))
 
 
-def pp_SPA(R, K, num_clusters=None):
-    """
-    Pseudo-point SPA tailored for your pipeline.
-    Returns: list of K integer indices valid for R.
-    """
-    print("computing shape of R")
-    n = R.shape[0]
-    print("shape = ", n)
-    
-    # 1. Heuristic: How many pseudo-points? (Paper suggests L > K)
-    # Usually 10*K to 20*K is good, but must be less than n.
-    if num_clusters is None:
-        num_clusters = min(n, max(K * 20, 50))
-    
-    # 2. Generating Pseudo-points (Denoising)
-    # We use MiniBatchKMeans because it's fast and consistent with your PPTM
-    kmeans = MiniBatchKMeans(
-        n_clusters=num_clusters, 
-        batch_size=256,
-        n_init='auto', 
-        random_state=42
-    )
-    kmeans.fit(R)
-    print("fitted k means")
-    
-    # These are the 'M' matrix in the paper (The centroids)
-    pseudo_points = kmeans.cluster_centers_
-    
-    # 3. Run YOUR SPA on the pseudo-points
-    # NOTE: These indices refer to the 'pseudo_points' array, NOT R!
-    # Returns e.g., [5, 12, 0, ...] (indices 0 to num_clusters-1)
-    _, pseudo_indices = SPA(pseudo_points, K)
-    print("done doing SPA")
-    
-    # Extract the actual vectors of the chosen vertices
-    chosen_centroids = pseudo_points[pseudo_indices]
-    print("so far so good")
-    
-    # 4. Map Back: Find the original rows in R closest to these centroids
-    # This is necessary because your Topic_SCORE needs indices [0...n]
-    # Calculate distance between the K chosen centroids and all N original points
-    # Shape: (K, n)
-    dists = cdist(chosen_centroids, R, metric='euclidean')
-    print("cmputing dist")
-    
-    # For each chosen centroid, find the index of the closest original point
-    # Returns shape (K,)
-    final_indices = np.argmin(dists, axis=1)
-    print("done with final indices")
-    print("final_indices = ", final_indices)
-    print("type of indices = ", type(final_indices))
-    return final_indices.tolist()
-
-
 
 
 
@@ -268,3 +214,41 @@ def top_k_docs_info_per_topic(es_model, W_hat, doc_indices, k):
     top_k_ind = doc_indices[np.argsort(W_hat[topic,:])[::-1][:k]]
     anchor_doc_info.append(top_k_ind)
   return anchor_doc_info
+
+
+def fit_classic_btl_llmarena(dataset):
+    pairs = []
+    for a, b, w in zip(
+        dataset.model_a_ids,
+        dataset.model_b_ids,
+        dataset.winners
+    ):
+        if w == 0:
+            pairs.append((a, b))
+        else:
+            pairs.append((b, a))
+
+    theta = choix.ilsr_pairwise(
+        len(dataset.journal_names),
+        pairs
+    )
+    theta -= theta.mean()   # identifiability
+    return theta
+
+def fit_classic_btl_madstat(dataset):
+    C = dataset.citation_matrix.tocoo()
+    pairs = []
+
+    for i, j in zip(C.row, C.col):
+        ji = dataset.journal_ids[i]
+        jj = dataset.journal_ids[j]
+        if ji != jj:
+            pairs.append((jj, ji))  # cited beats citing
+
+    theta = choix.ilsr_pairwise(
+        len(dataset.journal_names),
+        pairs
+    )
+    theta -= theta.mean()
+    return theta
+
