@@ -731,132 +731,136 @@ def compare_multiple_models(analyzers: Dict[str, BTLPPTMAnalyzer],
 
 
 
-
 def plot_btl(
     journals,
     theta_scores,
-    width_per_bar=0.5,
-    height=7,
     title='',
-    ylabel='θ (Strength Parameter)',
+    xlabel=r'$\hat{\theta}$ (Strength Parameter)',
     save_path=None,
     dpi=300,
-    min_fontsize=11,
-    show_values=True
+    min_fontsize=10,
+    show_values=False
 ):
     """
-    Create a vertical bar chart visualization of BTL theta rankings.
+    Create a two-column horizontal BTL ranking plot:
+    - Positive (blue) scores on the left
+    - Negative (red) scores on the right
     """
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # ---------------------------
+    # Sort by theta (worst -> best)
+    # ---------------------------
+    theta_scores = np.asarray(theta_scores)
+    order = np.argsort(theta_scores)
+    theta_sorted = theta_scores[order]
+    journals_sorted = np.array(journals)[order]
+
+    # ---------------------------
+    # Split positive / negative
+    # ---------------------------
+    neg_mask = theta_sorted < 0
+    pos_mask = theta_sorted >= 0
+
+    theta_neg = theta_sorted[neg_mask]
+    journals_neg = journals_sorted[neg_mask]
+
+    theta_pos = theta_sorted[pos_mask]
+    journals_pos = journals_sorted[pos_mask]
+
+    n_total = len(theta_sorted)
 
     # ---------------------------
     # Figure sizing
     # ---------------------------
-    n_journals = len(journals)
-    figwidth = max(width_per_bar * n_journals, 12)
+    fig_height = max(6, 0.2 * n_total)
 
-    fig, ax = plt.subplots(
-        figsize=(figwidth, height),
-        constrained_layout=True   # <-- CLEAN FIX
+    fig, (ax_left, ax_right) = plt.subplots(
+        ncols=2,
+        sharey=True,
+        figsize=(15, fig_height),
+        constrained_layout=True
     )
 
     # ---------------------------
-    # Colors
+    # Colors (preserve semantics)
     # ---------------------------
-    colors = plt.cm.RdYlBu_r(np.linspace(0.15, 0.85, n_journals))
+    blues = plt.cm.Blues(np.linspace(0.4, 0.9, len(theta_pos)))
+    reds = plt.cm.Reds(np.linspace(0.4, 0.9, len(theta_neg)))
 
     # ---------------------------
-    # Bars
+    # Left panel: positive scores
     # ---------------------------
-    x_pos = np.arange(n_journals)
-    bars = ax.bar(
-        x_pos,
-        theta_scores,
-        color=colors,
+    ax_left.barh(
+        journals_pos,
+        theta_pos,
+        color=blues,
         edgecolor='white',
-        linewidth=0.5,
-        width=0.85
+        linewidth=0.6
     )
+    ax_left.invert_xaxis()
+    ax_left.set_xlim(0, max(theta_pos.max(), 1e-3) * 1.05)
+    ax_left.set_title('Higher skill', fontsize=12, fontweight='bold')
+    ax_left.set_xlabel(xlabel, fontsize=11)
 
     # ---------------------------
-    # X ticks & labels
+    # Right panel: negative scores
     # ---------------------------
-    ax.set_xticks(x_pos)
-
-    label_fontsize = max(min_fontsize, min(11, 400 / n_journals))
-
-    if n_journals > 50:
-        rotation = 90
-        ha = 'center'
-        va = 'top'
-    else:
-        rotation = 45
-        ha = 'right'
-        va = 'top'
-
-    ax.set_xticklabels(
-        journals,
-        rotation=rotation,
-        ha=ha,
-        va=va,
-        fontsize=label_fontsize
+    ax_right.barh(
+        journals_neg,
+        theta_neg,
+        color=reds,
+        edgecolor='white',
+        linewidth=0.6
     )
+    ax_right.set_xlim(min(theta_neg.min(), -1e-3) * 1.05, 0)
+    ax_right.set_title('Lower skill', fontsize=12, fontweight='bold')
+    ax_right.set_xlabel(xlabel, fontsize=11)
 
     # ---------------------------
-    # Labels & title
+    # Zero reference lines
     # ---------------------------
-    ax.set_ylabel(ylabel, fontsize=13, fontweight='bold')
-    ax.set_title(title, fontsize=15, fontweight='bold', pad=15)
+    ax_left.axvline(0, color='black', linewidth=0.8, alpha=0.6)
+    ax_right.axvline(0, color='black', linewidth=0.8, alpha=0.6)
 
     # ---------------------------
-    # Reference line & grid
+    # Tick label size
     # ---------------------------
-    ax.axhline(0, color='black', linewidth=0.8, alpha=0.3)
-    ax.grid(axis='y', linestyle='--', linewidth=0.5, alpha=0.3)
-    ax.set_axisbelow(True)
+    label_fontsize = max(min_fontsize, min(11, 350 / n_total))
+    ax_left.tick_params(axis='y', labelsize=label_fontsize)
+    ax_right.tick_params(axis='y', labelsize=label_fontsize)
 
     # ---------------------------
-    # Value labels
+    # Optional value labels (not recommended for many items)
     # ---------------------------
-    if show_values:
-        if n_journals <= 50:
-            value_fontsize = max(6, min(8, 300 / n_journals))
-            for i, (bar, score) in enumerate(zip(bars, theta_scores)):
-                if score >= 0:
-                    ax.text(
-                        i, score + 0.08, f'{score:.2f}',
-                        ha='center', va='bottom',
-                        fontsize=value_fontsize
-                    )
-                else:
-                    ax.text(
-                        i, score - 0.08, f'{score:.2f}',
-                        ha='center', va='top',
-                        fontsize=value_fontsize
-                    )
-        else:
-            step = max(1, n_journals // 20)
-            for i in range(0, n_journals, step):
-                score = theta_scores[i]
-                ax.text(
-                    i,
-                    score + (0.08 if score >= 0 else -0.08),
-                    f'{score:.2f}',
-                    ha='center',
-                    va='bottom' if score >= 0 else 'top',
-                    fontsize=7
-                )
+    if show_values and n_total <= 25:
+        for y, val in zip(journals_pos, theta_pos):
+            ax_left.text(
+                val * 0.98, y, f'{val:.2f}',
+                ha='right', va='center', fontsize=9
+            )
+        for y, val in zip(journals_neg, theta_neg):
+            ax_right.text(
+                val * 0.98, y, f'{val:.2f}',
+                ha='left', va='center', fontsize=9
+            )
 
     # ---------------------------
     # Aesthetic cleanup
     # ---------------------------
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
+    for ax in (ax_left, ax_right):
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_visible(False)
+        ax.grid(axis='x', linestyle='--', linewidth=0.5, alpha=0.3)
+        ax.set_axisbelow(True)
 
-    y_min, y_max = min(theta_scores), max(theta_scores)
-    padding = 0.1 * (y_max - y_min)
-    ax.set_ylim(y_min - padding, y_max + padding)
-
-    ax.set_xlim(-0.5, n_journals - 0.5)
+    # ---------------------------
+    # Title
+    # ---------------------------
+    fig.suptitle(title, fontsize=15, fontweight='bold')
 
     # ---------------------------
     # Save
@@ -864,4 +868,4 @@ def plot_btl(
     if save_path:
         fig.savefig(save_path, dpi=dpi, bbox_inches='tight')
 
-    return fig, ax
+    return fig, (ax_left, ax_right)
