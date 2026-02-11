@@ -48,283 +48,10 @@ import numpy as np
 from itertools import compress
 import gc
 from collections import Counter
+from bert_embeddings import *
+from vocab_cleaning import clean_vocabulary, drop_short_documents
 
 
-
-def merge_subtokens(tokens: List[str], 
-                    embeddings: np.ndarray, 
-                    doc_lengths: np.ndarray):
-    """
-    Collapse subtokens back into full words by averaging their embeddings.
-    Auto-detects BERT (##) vs RoBERTa (Ġ) tokenization styles.
-    """
-    merged_embs = []
-    merged_lens = []
-    merged_vocab = []
-
-    idx = 0
-    
-    # Check the first few tokens to guess the style
-    # RoBERTa uses 'Ġ' (U+0120) to represent spaces
-    is_roberta = any('Ġ' in t for t in tokens[:100])
-    
-    print(f"  Merge logic detected: {'RoBERTa (Prefix Space)' if is_roberta else 'BERT (Suffix ##)'}")
-
-    for i, length in enumerate(doc_lengths):
-        end = idx + length
-        
-        if length == 0:
-            merged_lens.append(0)
-            idx = end
-            continue
-            
-        doc_toks = tokens[idx:end]
-        doc_embs = embeddings[idx:end]
-        idx = end
-
-        curr_embs = []
-        curr_pieces = []
-        doc_merged_embs = []
-        doc_merged_words = []
-
-        for j, (tok, emb) in enumerate(zip(doc_toks, doc_embs)):
-            
-            # -------------------------------------------------
-            # LOGIC: Should we merge this token to the previous?
-            # -------------------------------------------------
-            should_merge = False
-            
-            if is_roberta:
-                # RoBERTa: Merge if it does NOT start with 'Ġ' (and isn't the first token)
-                # Note: The very first token of a doc often doesn't have 'Ġ' either, so we don't merge j=0
-                if j > 0 and not tok.startswith('Ġ'):
-                    should_merge = True
-            else:
-                # BERT: Merge if it STARTS with '##'
-                if tok.startswith("##"):
-                    should_merge = True
-
-            # -------------------------------------------------
-            # EXECUTE MERGE
-            # -------------------------------------------------
-            if should_merge:
-                # It is a suffix -> Add to buffer
-                curr_embs.append(emb)
-                
-                # Clean text for vocab
-                clean_tok = tok.replace("##", "") # BERT clean
-                curr_pieces.append(clean_tok)
-                
-            else:
-                # It is a NEW word -> Flush buffer & Start new
-                if curr_embs:
-                    # Average previous word embeddings
-                    avg_emb = np.mean(curr_embs, axis=0)
-                    doc_merged_embs.append(avg_emb)
-                    doc_merged_words.append("".join(curr_pieces))
-                
-                # Start new buffer
-                curr_embs = [emb]
-                
-                # Clean text for vocab (Remove RoBERTa's G)
-                clean_tok = tok.replace("Ġ", "").replace("##", "")
-                curr_pieces = [clean_tok]
-        
-        # Flush the very last word of the document
-        if curr_embs:
-            avg_emb = np.mean(curr_embs, axis=0)
-            doc_merged_embs.append(avg_emb)
-            doc_merged_words.append("".join(curr_pieces))
-
-        # -------------------------------------------------
-        # STORE RESULT
-        # -------------------------------------------------
-        if len(doc_merged_embs) > 0:
-            stacked = np.vstack(doc_merged_embs)
-            merged_embs.append(stacked)
-            merged_lens.append(len(stacked))
-            merged_vocab.extend(doc_merged_words)
-        else:
-            merged_lens.append(0)
-
-    # ========================================================
-    # MEMORY-EFFICIENT FINAL STACK
-    # ========================================================
-    if not merged_embs:
-        print("Warning: No valid embeddings found.")
-        return np.empty((0,0)), np.array([]), []
-
-    # Calculate dimensions
-    total_words = sum(len(emb) for emb in merged_embs)
-    embed_dim = merged_embs[0].shape[1]
-    
-    # Pre-allocate
-    flat_embs = np.empty((total_words, embed_dim), dtype=np.float32)
-    
-    current_idx = 0
-    for emb_array in merged_embs:
-        L = len(emb_array)
-        flat_embs[current_idx:current_idx + L] = emb_array
-        current_idx += L
-    
-    # Cleanup
-    del merged_embs
-    import gc
-    gc.collect()
-    
-    flat_lens = np.array(merged_lens, dtype=np.int32)
-    
-    return flat_embs, flat_lens, merged_vocab
-
-
-class BERTEmbeddingExtractor:
-    """
-    Extracts RAW contextualized subtoken embeddings and performs PCA.
-    Does NOT merge subtokens; delegates that to the external merge_subtokens function.
-    Compatible with both BERT and RoBERTa.
-    """
-    
-    def __init__(self, model_name='roberta-base', embed_dim=20, device='auto'):
-        self.model_name = model_name
-        self.device = 'cuda' if device == 'auto' and torch.cuda.is_available() else 'cpu'
-        self.tokenizer = None
-        self.model = None
-        self.embed_dim = embed_dim
-        
-    def load_model(self):
-        """Load Model and Tokenizer"""
-        print(f"Loading {self.model_name} on {self.device}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-        self.model = AutoModel.from_pretrained(self.model_name)
-        self.model.to(self.device)
-        self.model.eval()
-
-    def extract_embeddings(
-        self,
-        texts: List[str],
-        batch_size: int = 16,
-        max_length: int = 512,
-        verbose: bool = True,
-        pca_fit_batches: int = 50,
-    ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
-        """
-        Returns:
-        - embeddings: (N_subtokens, embed_dim) -> Reduced dimension vectors
-        - doc_lengths: (n_docs,) -> Number of subtokens per document
-        - tokens: List[str] -> The raw subtokens (e.g. 'Ġword', 'ing', '##ing')
-        """
-
-        if self.model is None:
-            self.load_model()
-
-        # Temporary storage
-        all_embeddings: List[np.ndarray] = [] # Stores 768-d vectors temporarily
-        doc_lengths: List[int] = []
-        all_tokens: List[str] = []
-
-        n_batches = (len(texts) + batch_size - 1) // batch_size
-
-        if verbose:
-            print(f"Extracting raw subtoken embeddings from {len(texts)} documents...")
-
-        # ------------------------------------------------------------
-        # PASS 1: Forward Pass & Filter Special Tokens
-        # ------------------------------------------------------------
-        for batch_idx in range(n_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, len(texts))
-            
-            if verbose and batch_idx % 10 == 0:
-                print(f"  Processing batch {batch_idx + 1}/{n_batches}")
-
-            batch_texts = texts[start_idx:end_idx]
-
-            # Tokenize
-            inputs = self.tokenizer(
-                batch_texts,
-                return_tensors="pt",
-                padding=True,
-                truncation=True,
-                max_length=max_length
-            )
-            inputs_device = {k: v.to(self.device) for k, v in inputs.items()}
-
-            with torch.no_grad():
-                outputs = self.model(**inputs_device)
-                hidden = outputs.last_hidden_state  # (B, L, 768)
-
-            # Move to CPU for processing
-            hidden_cpu = hidden.cpu().numpy()
-            input_ids_cpu = inputs["input_ids"].cpu().numpy()
-            
-            # Process each document in batch
-            for j in range(len(batch_texts)):
-                ids = input_ids_cpu[j]
-                
-                # Create mask for valid tokens (ignore padding & special tokens like CLS/SEP)
-                # get_special_tokens_mask returns 1 for special tokens, 0 for real words
-                special_mask = self.tokenizer.get_special_tokens_mask(ids, already_has_special_tokens=True)
-                valid_indices = [i for i, is_special in enumerate(special_mask) if is_special == 0]
-                
-                # Apply mask - only keep real text subtokens
-                if valid_indices:
-                    # 1. Get Embeddings
-                    seq_emb = hidden_cpu[j, valid_indices, :] # (n_valid, 768)
-                    
-                    # 2. Get Tokens (Strings)
-                    # convert_ids_to_tokens gives us ['ĠHello', 'world'] or ['play', '##ing']
-                    valid_ids = ids[valid_indices]
-                    seq_toks = self.tokenizer.convert_ids_to_tokens(valid_ids)
-                    
-                    all_embeddings.append(seq_emb)
-                    doc_lengths.append(len(seq_emb))
-                    all_tokens.extend(seq_toks)
-                else:
-                    doc_lengths.append(0)
-
-            # Cleanup GPU
-            del inputs, inputs_device, outputs, hidden
-            if batch_idx % 10 == 0 and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        # ------------------------------------------------------------
-        # PASS 2: PCA Fitting (on 768-d subtokens)
-        # ------------------------------------------------------------
-        if verbose:
-            print(f"Fitting IncrementalPCA to reduce {all_embeddings[0].shape[1]} -> {self.embed_dim}...")
-
-        ipca = IncrementalPCA(n_components=self.embed_dim)
-        
-        fit_batches = min(pca_fit_batches, len(all_embeddings))
-        for i in range(fit_batches):
-            ipca.partial_fit(all_embeddings[i])
-
-        if verbose:
-            print(f"  PCA explained variance: {ipca.explained_variance_ratio_.sum():.3f}")
-
-        # ------------------------------------------------------------
-        # PASS 3: Transform & Flatten
-        # ------------------------------------------------------------
-        total_subtokens = sum(len(e) for e in all_embeddings)
-        final_embeddings = np.empty((total_subtokens, self.embed_dim), dtype=np.float32)
-
-        cur = 0
-        for i, emb in enumerate(all_embeddings):
-            reduced = ipca.transform(emb)
-            L = reduced.shape[0]
-            final_embeddings[cur : cur + L] = reduced
-            cur += L
-
-        # Final cleanup
-        del all_embeddings
-        gc.collect()
-
-        doc_lengths = np.array(doc_lengths, dtype=np.int32)
-        
-        if verbose:
-            print(f"✓ Extraction complete. {total_subtokens:,} raw subtokens ready for merging.")
-
-        return final_embeddings, doc_lengths, all_tokens
 
 class PPTMTopicModel:
     """
@@ -386,8 +113,6 @@ class PPTMTopicModel:
         return np.argmax(self.topic_weights, axis=1)
 
 
-
-
 class TopicSpecificBTL:
     """
     Topic-Specific Bradley–Terry–Luce model
@@ -408,10 +133,10 @@ class TopicSpecificBTL:
         self,
         n_topics: int,
         n_journals: int,
-        reg_lambda: float = 1e-3,
+        reg_lambda: float = 0,
         use_debiased: bool = False,
         step_size: float = 2,
-        max_iter: int = 200,
+        max_iter: int = 10000,
         tol: float = 1e-6,
     ):
         self.K = int(n_topics)
@@ -432,6 +157,12 @@ class TopicSpecificBTL:
     def _project(self, S: np.ndarray) -> np.ndarray:
         """Project onto identifiability subspace V: mean(S)=0."""
         return S - S.mean()
+    
+    def _project_llmarena(self, S: np.ndarray) -> np.ndarray:
+        """Project onto identifiability subspace V: mean(S_i)=0 for all rows."""
+        #print("so far shape of S is ", S.shape)
+        return S - S.mean(axis=0, keepdims=True)
+
 
     @staticmethod
     def _sigmoid(x):
@@ -610,6 +341,7 @@ class TopicSpecificBTL:
 
         # 5. Regularization
         grad /= n_battles
+        print("grad = ", grad)
         grad -= 2.0 * self.reg_lambda * S
         return -grad.flatten()
     # ------------------------------------------------------------------
@@ -661,10 +393,12 @@ class TopicSpecificBTL:
             # Correction for i
             correction_i = Sigma_delta_w[i] @ S[ji]
             C0[ji] += alpha * correction_i
+            #C0[ji] -= alpha * correction_i
 
             # Correction for j
             correction_j = Sigma_delta_w[j] @ S[jj]
             C0[jj] += alpha * correction_j
+            #C0[jj] -= alpha * correction_j
 
         #grad -= 2.0 * self.reg_lambda * S
         grad_star = grad - C0
@@ -673,7 +407,7 @@ class TopicSpecificBTL:
 
 
     # ------------------------------------------------------------------
-    # Main fit entry point
+    # Main fit
     # ------------------------------------------------------------------
 
     def fit(
@@ -733,15 +467,7 @@ class TopicSpecificBTL:
                 jac=self._mle_gradient,  # <--- PASS THE GRADIENT HERE!
                 options={"maxiter": self.max_iter, "ftol": 1e-9},
             )
-
-            # result = minimize(
-            #     self._negative_log_likelihood,
-            #     S0.flatten(),
-            #     args=(citation_pairs, topic_weights, journal_ids),
-            #     method="L-BFGS-B",
-            #     options={"maxiter": self.max_iter, "ftol": 1e-9},
-            # )
-
+            
             self.S = self._project(result.x.reshape(self.M, self.K))
 
             if verbose:
@@ -821,36 +547,6 @@ class TopicSpecificBTL:
     
 
 
-    # def fit_battles(self, model_A_ids, model_B_ids, winners, topic_weights, verbose=True):
-    #     """
-    #     Specialized fit method for LLM Arena (Battle List format).
-    #     """
-    #     from scipy.optimize import minimize
-        
-    #     if verbose:
-    #         print(f"   Optimizing S matrix ({self.M} models x {self.K} topics)...")
-            
-    #     S0 = np.zeros((self.M, self.K))
-        
-    #     # Define arguments tuple
-    #     args = (model_A_ids, model_B_ids, winners, topic_weights)
-        
-    #     # Run L-BFGS-B
-    #     result = minimize(
-    #         fun=self._negative_log_likelihood_battles, # You need to implement this (see below)
-    #         x0=S0.flatten(),
-    #         args=args,
-    #         method="L-BFGS-B",
-    #         jac=self._mle_gradient_battles,            # You implemented this earlier!
-    #         options={"maxiter": 100, "ftol": 1e-9}
-    #     )
-        
-    #     self.S = result.x.reshape(self.M, self.K)
-        
-    #     if verbose:
-    #         print(f"   ✓ Optimization Converged: Success={result.success}")
-    #         print(f"   ✓ Final Loss: {result.fun:.4f}")
-
     def _negative_log_likelihood_battles(self, S_flat, model_A_ids, model_B_ids, winners, topic_weights):
             """
             NLL for Battles: Sum of log(sigmoid(Winner_Score - Loser_Score))
@@ -892,6 +588,7 @@ class TopicSpecificBTL:
         S = S_flat.reshape(self.M, self.K)
         n_battles = len(winners)
         grad = np.zeros_like(S)
+        self.reg_lambda = 0
 
         # 1. Scores
         mu_A = np.sum(topic_weights * S[model_A_ids], axis=1)
@@ -1000,6 +697,8 @@ class TopicSpecificBTL:
         grad_star = (grad_mle - C0) / n_battles
         
         return grad_star
+    
+    
     def fit_battles(
         self, 
         model_A_ids, 
@@ -1021,22 +720,60 @@ class TopicSpecificBTL:
         # ============================================================
         # Case 1: Standard MLE (L-BFGS-B)
         # ============================================================
+        # if not self.use_debiased:
+        #     #S0 = np.ones((self.M, self.K))
+        #     S0 = np.random.normal(0, 0.1, (self.M, self.K))
+        #     S0 = self._project_llmarena(S0)
+
+        #     result = minimize(
+        #         fun=self._negative_log_likelihood_battles,
+        #         x0=S0.flatten(),
+        #         args=(model_A_ids, model_B_ids, winners, topic_weights),
+        #         method="L-BFGS-B",
+        #         jac=self._mle_gradient_battles,
+        #         options={"maxiter": self.max_iter, "ftol": self.tol}
+        #     )
+        
+        #     self.S = self._project_llmarena(result.x.reshape(self.M, self.K))
+
+    
+        #     if verbose:
+        #         print(f"   ✓ Optimization Converged: {result.success}, Loss: {result.fun:.4f}")
+        #     return self
         if not self.use_debiased:
-            S0 = np.zeros((self.M, self.K))
+            S = np.random.normal(0, 0.1, (self.M, self.K))
+            S = self._project_llmarena(S)
             
-            result = minimize(
-                fun=self._negative_log_likelihood_battles,
-                x0=S0.flatten(),
-                args=(model_A_ids, model_B_ids, winners, topic_weights),
-                method="L-BFGS-B",
-                jac=self._mle_gradient_battles,
-                options={"maxiter": self.max_iter, "ftol": self.tol}
-            )
-            
-            self.S = self._project(result.x.reshape(self.M, self.K))
-            
-            if verbose:
-                print(f"   ✓ Optimization Converged: {result.success}, Loss: {result.fun:.4f}")
+            for t in range(self.max_iter):
+                # 1. Compute gradient (minimization direction)
+                grad = self._mle_gradient_battles(
+                    S.flatten(), model_A_ids, model_B_ids, winners, topic_weights
+                ).reshape(self.M, self.K)
+                
+                # 2. Gradient step + project
+                S_new = self._project_llmarena(S - self.step_size * grad)
+                
+                # 3. Convergence check
+                diff = np.linalg.norm(S_new - S)
+
+                if t < 5:
+                    print(f"  iter {t} col sums: {S_new.sum(axis=0)}")
+                
+                if verbose and t % 10 == 0:
+                    nll = self._negative_log_likelihood_battles(
+                        S_new.flatten(), model_A_ids, model_B_ids, winners, topic_weights
+                    )
+                    print(f"  iter {t:4d} | diff={diff:.2e} | NLL={nll:.6f}")
+                
+                if diff < self.tol:
+                    if verbose: print(f"  ✓ Converged at iter {t}")
+                    break
+                
+                S = S_new
+                   
+            self.S = S
+            print(self.S.shape)
+            print("sum of columns of S = ", self.S.sum(axis=0))
             return self
 
         # ============================================================
@@ -1051,7 +788,8 @@ class TopicSpecificBTL:
         
         # Initialize S
         S = np.random.normal(0, 0.1, (self.M, self.K))
-        S = self._project(S)
+        S = self._project_llmarena(S)
+        #S = self._project(S)
         
         # PGD Loop
         for t in range(self.max_iter):
@@ -1065,7 +803,8 @@ class TopicSpecificBTL:
             total_grad = grad - (2.0 * self.reg_lambda * S)
             
             # 3. Update Step (Ascent)
-            S_new = self._project(S + self.step_size * total_grad)
+            S_new = self._project_llmarena(S + self.step_size * total_grad)
+            #S_new = self._project(S + self.step_size * total_grad)
             
             # 4. Convergence Check
             diff_norm = np.linalg.norm(S_new - S)
@@ -1084,10 +823,6 @@ class TopicSpecificBTL:
         if verbose: print("   ✓ Debiased PGD completed")
         return self
 
-    
-
-
-    
     def get_journal_rankings(self, topic_distribution: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get journal rankings for specific topic distribution
@@ -1140,8 +875,8 @@ class TopicSpecificBTL:
 
 
 class BTLPPTMAnalyzer:
-    def __init__(self, n_topics=10, n_hyperwords=500, embed_dim=30,
-                 model_name='distilbert-base-uncased', reg_lambda=1e-3,
+    def __init__(self, debiased=False, n_topics=10, n_hyperwords=500, embed_dim=30,
+                 model_name='distilbert-base-uncased', reg_lambda=0.0,
                  random_seed=42):
         self.n_topics = n_topics
         self.n_hyperwords = n_hyperwords
@@ -1156,6 +891,7 @@ class BTLPPTMAnalyzer:
         self.doc_lengths = None
         self.vocab: List[str] = None
         self.topic_weights = None
+        self.debiased = debiased
 
 
 
@@ -1203,7 +939,7 @@ class BTLPPTMAnalyzer:
             
             if verbose: print(f"✓ Removed {n_orig - n_new} duplicates. New size: {n_new}")
 
-            # 3. SYNC THE DATASET OBJECT (Crucial!)
+            # 3. UPDATE THE DATASET OBJECT 
             # We must update the dataset arrays to match this new shorter list
             # otherwise your winners/citations will be misaligned.
             keep_indices = np.array(keep_indices)
@@ -1220,13 +956,6 @@ class BTLPPTMAnalyzer:
                 # Handle Citation Matrix
                 C = self.dataset.citation_matrix
                 if C.shape[0] == C.shape[1]: # Square matrix (Paper x Paper)
-                    # We usually can't simply slice a citation graph like this without 
-                    # breaking links, but for MadStat (which is Papers->Papers), 
-                    # removing a paper usually just removes its node.
-                    # Ideally, citation networks shouldn't be deduped by text unless
-                    # it's literally the same paper recorded twice.
-                    # For safety in Citation Mode, you might want to SKIP dedup 
-                    # or handle it very carefully.
                     if verbose: print("⚠ Warning: Deduplicating a citation network graph is risky. Slicing matrix...")
                     self.dataset.citation_matrix = C[keep_indices][:, keep_indices]
                 else:
@@ -1244,246 +973,34 @@ class BTLPPTMAnalyzer:
             verbose=verbose
         )
 
-        # print("embedings example = ", sub_embs[:10])
-        # print("example of sub lens = ", sub_lens[:10])
-        # print("example of sub tokens = ", sub_tokens[:10])
         if verbose: print("✓ Subtoken embeddings extracted")
 
-        # -----------------------------------------------------------
-        # Step 2: Merge Subtokens & Clean Vocab
-        # -----------------------------------------------------------
         emb, lens, vocab = merge_subtokens(sub_tokens, sub_embs, sub_lens)
         if verbose: print(f"✓ Merged into {len(vocab)} words")
-        # print("example vocab", vocab[:10])
-        # print(emb.shape)
-        # print(len(vocab))
-
-
-
 
         # ============================================================
         # STEP 2: ADVANCED VOCABULARY CLEANING & FILTERING
         # ============================================================
         if verbose: print("\nStep 2: Advanced Vocabulary Cleaning...")
 
-        # 1. SETUP NLP FOR POS TAGGING
-        #    We need this to differentiate "Apple" (Noun) from "Ate" (Verb)
+        # Step 2: Clean vocabulary
         try:
             if not hasattr(self, 'nlp') or self.nlp is None:
                 self.nlp = spacy.load("en_core_web_sm", disable=['parser', 'ner'])
         except Exception as e:
             self.nlp = None
-            print(f"⚠️ Spacy load failed ({e}). Topics will contain verbs/junk.")
+            print(f"⚠️ Spacy load failed ({e}).")
 
-        # 2. DEFINE AGGRESSIVE STOPWORDS
-        #    Combine Standard + Riddles + LLM Boilerplate
-        STOPWORDS = set(ENGLISH_STOP_WORDS)
-        
-        riddle_words = [
-            "brother", "sister", "sally", "apple", "feather", "brick", "pound", "kg", "lb", 
-            "weighs", "heavier", "lighter", "yesterday", "today", "tomorrow", "woodchuck"
-        ]
-        
-        chatbot_fluff = [
-            "example", "question", "answer", "response", "assistant", "user", "prompt",
-            "chat", "bot", "explain", "describe", "story", "write", "tell", "say",
-            "create", "make", "provide", "following", "using", "based", "according",
-            "please", "thanks", "help", "input", "output", "given", "select",
-            "task", "context", "instruction", "step", "steps", "list", "generate",
-            "function", "code", "return", "true", "false", "value", "variable", "string", "print"
-        ]
+        vocab, emb, lens = clean_vocabulary(
+            vocab, emb, lens, nlp=self.nlp, 
+            min_freq=10, max_df_ratio=0.5, verbose=verbose
+        )
 
-        common_names = [
-            "tom", "jill", "matt", "paul", "steve", "jesus", "smith", "peter", 
-            "maria", "john", "david", "anna", "george", "adam", "bob"
-        ]
-        
-        # 2. Generic Adjectives (Topic 12 cleanup)
-        generic_adjectives = [
-            "vital", "important", "essential", "crucial", "interesting", 
-            "great", "helpful", "good", "bad", "new", "main", "biggest"
-        ]
-        
-        # 3. Multilingual Particles (Topic 2 cleanup)
-        foreign_noise = [
-            "ist", "mir", "der", "die", "und", "que", "est", "le", "la", "des"
-        ]
-        
-        # 4. Unit Artifacts (Topic 14 cleanup - optional, keep if you want a "Math" topic)
-        units = ["pounds", "lbs", "liters", "degrees", "cloud", "cut"]
-        
-        STOPWORDS.update(riddle_words)
-        STOPWORDS.update(chatbot_fluff)
-        STOPWORDS.update(common_names)
-        STOPWORDS.update(generic_adjectives)
-        STOPWORDS.update(foreign_noise)
-        STOPWORDS.update(units)
-
-        # Regex Helpers
-        VALID_WORD = re.compile(r"^[a-zA-Z][a-zA-Z\-']*[a-zA-Z]$")  
-        REPEAT_JUNK = re.compile(r"(.)\1{2,}")  # e.g., "aaaaa"
-        ascii_ratio = lambda s: sum(ord(c) < 128 for c in s) / max(len(s), 1)
-
-        # 3. PRE-COMPUTE POS TAGS (Optimization: Tag unique words only)
-        allowed_pos_words = set()
-        if self.nlp:
-            if verbose: print("  Performing POS tagging (keeping Nouns/Adjectives only)...")
-            unique_vocab = list(set(vocab))
-            
-            # Batch process for speed (chunks of 2000)
-            chunk_size = 2000
-            for i in range(0, len(unique_vocab), chunk_size):
-                chunk = unique_words_chunk = unique_vocab[i:i+chunk_size]
-                # Join with spaces to allow context approximation, or tag individually
-                # Fast version: tag as a list
-                doc = self.nlp.pipe(unique_words_chunk, batch_size=50)
-                
-                # for token_doc in doc:
-                #     # Spacy pipe returns docs, we grab the first token since we fed single words
-                #     token = token_doc[0] 
-                #     if token.pos_ in ['NOUN', 'PROPN', 'ADJ']:
-                #         allowed_pos_words.add(token.text)
-                for token_doc in doc:
-                    # --- SAFETY CHECK ---
-                    # Only access [0] if the doc actually has words
-                    if len(token_doc) > 0:
-                        token = token_doc[0] 
-                        if token.pos_ in ['NOUN', 'PROPN', 'ADJ']:
-                            allowed_pos_words.add(token.text)
-        else:
-            # Fallback: Allow everything if spacy fails
-            allowed_pos_words = set(vocab)
-
-        # 4. COMPUTE TF AND DF
-        counts = Counter()      # Total Term Frequency
-        doc_counts = Counter()  # Document Frequency
-        
-        current_idx = 0
-        total_docs = len(lens)
-        
-        # Loop through docs to count
-        for doc_len in lens:
-            doc_slice = vocab[current_idx : current_idx + doc_len]
-            
-            # Update TF
-            counts.update(doc_slice)
-            
-            # Update DF (use set for uniqueness per doc)
-            doc_counts.update(set(doc_slice))
-            
-            current_idx += doc_len
-
-        # 5. DEFINE THE MASTER FILTER
-        min_freq = 10       # Word must appear 10 times total
-        max_df_ratio = 0.5  # Word must NOT appear in > 50% of docs (removes "the", "use")
-
-        def is_clean_token(w):
-            w_lower = w.strip().lower()
-            
-            # A. Structure Checks
-            if not VALID_WORD.match(w): return False
-            if len(w) < 3 or len(w) > 18: return False
-            if REPEAT_JUNK.fullmatch(w_lower): return False
-            if ascii_ratio(w) < 0.85: return False
-            
-            # B. Stopword Checks
-            if w_lower in STOPWORDS: return False
-            
-            # C. Statistics Checks
-            if counts[w] < min_freq: return False
-            if (doc_counts[w] / total_docs) > max_df_ratio: return False
-            
-            # D. POS Check (The Semantic Filter)
-            if self.nlp and w not in allowed_pos_words: return False
-            
-            return True
-
-        if verbose: print(f"  Applying filters: MinFreq={min_freq}, MaxDF={max_df_ratio}, POS=Noun/Adj")
-
-        # 6. APPLY FILTER TO CREATE MASK
-        # This mask aligns 1-to-1 with 'vocab' and 'emb'
-        final_mask = np.array([is_clean_token(w) for w in vocab], dtype=bool)
-
-        # 7. UPDATE DATA STRUCTURES
-        # Update Vocab
-        vocab = list(compress(vocab, final_mask))
-        print("vocab = ", vocab[:50])
-        
-        # Update Embeddings
-        emb = emb[final_mask]
-
-        # Update Document Lengths
-        # We must sum the mask chunks corresponding to each document
-        filtered_lens = []
-        current_idx = 0
-        for doc_len in lens:
-            doc_mask = final_mask[current_idx : current_idx + doc_len]
-            filtered_lens.append(doc_mask.sum())
-            current_idx += doc_len
-        
-        lens = np.array(filtered_lens, dtype=np.int32)
-        print("mean lenght = ", lens.mean())
-
-        # Cleanup
-        del final_mask, counts, doc_counts, allowed_pos_words
-        gc.collect()
-
-        if verbose: print(f"✓ Vocabulary cleaned: {len(vocab)} semantic tokens remaining.")
-
-
-        # -----------------------------------------------------------
-        # STEP 3: HANDLE SHORT/ZERO-LENGTH DOCUMENTS
-        # -----------------------------------------------------------
-        # We define "short" as having fewer than 5 valid tokens
-        zero_mask = (lens < 5)
-        
-        if zero_mask.any():
-            num_drop = int(zero_mask.sum())
-            if verbose: print(f"⚠ Dropping {num_drop} documents with < 5 tokens.")
-            
-            # --- CRITICAL FIX START: SYNC VOCAB & EMBEDDINGS ---
-            
-            # 1. Create a mask for the TOKENS (flat list)
-            # We must identify which specific tokens belong to the bad docs
-            token_keep_mask = np.ones(len(emb), dtype=bool)
-            
-            current_idx = 0
-            for doc_idx, doc_len in enumerate(lens):
-                if zero_mask[doc_idx]: # If this doc is marked for deletion
-                    # Mark its tokens as False
-                    token_keep_mask[current_idx : current_idx + doc_len] = False
-                current_idx += doc_len
-            
-            # 2. Update the Flat Data Structures
-            emb = emb[token_keep_mask]
-            vocab = list(compress(vocab, token_keep_mask))
-            
-            # --- CRITICAL FIX END ---
-
-            # 3. Update the Document Lengths
-            keep_docs = ~zero_mask
-            lens = lens[keep_docs]
-            
-            # 4. Update Dataset Arrays (Battle vs Citation Mode)
-            if is_battle_mode:
-                self.dataset.prompts = [p for p, k in zip(self.dataset.prompts, keep_docs) if k]
-                self.dataset.model_a_ids = self.dataset.model_a_ids[keep_docs]
-                self.dataset.model_b_ids = self.dataset.model_b_ids[keep_docs]
-                self.dataset.winners = self.dataset.winners[keep_docs]
-            else:
-                self.dataset.abstracts = [a for a, k in zip(self.dataset.abstracts, keep_docs) if k]
-                self.dataset.journal_ids = np.asarray(self.dataset.journal_ids)[keep_docs]
-                
-                # Handle Citation Matrix
-                C = self.dataset.citation_matrix
-                if C.shape[0] == C.shape[1] and C.shape[0] == len(keep_docs):
-                     # If square and matches original size
-                    self.dataset.citation_matrix = C[keep_docs][:, keep_docs]
-                elif C.shape[0] == len(zero_mask): 
-                    # If rectangular or matching rows
-                    self.dataset.citation_matrix = C[keep_docs, :]
-
-            if verbose: print(f"✓ Drop complete. Final Dataset Size: {len(lens)} docs")
+        # Step 3: Drop short documents
+        vocab, emb, lens, self.dataset = drop_short_documents(
+            vocab, emb, lens, self.dataset, is_battle_mode,
+            min_tokens=5, verbose=verbose
+        )
 
         # -----------------------------------------------------------
         # Step 3: Run PPTM Topic Modeling
@@ -1508,7 +1025,7 @@ class BTLPPTMAnalyzer:
         
         # 1. DECIDE GLOBALLY if we want debiasing
         # You can make this an argument to .fit() or hardcode it here
-        ENABLE_DEBIASING = False  
+        ENABLE_DEBIASING = self.debiased  
         
         Sigma_delta_w = None
         if ENABLE_DEBIASING:
@@ -1678,9 +1195,6 @@ class BTLPPTMAnalyzer:
             Sigma_delta_w[i] = (term1 - term2) / (N_i - 1)
 
         return Sigma_delta_w
-
-
-
 
 
 if __name__ == "__main__":
