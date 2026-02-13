@@ -12,26 +12,14 @@ Analysis and visualization functions are in btl_analysis.py
 """
 
 import numpy as np
-import pandas as pd
 import scipy.sparse as sp
-from scipy.optimize import minimize
 from typing import Dict, List, Tuple, Optional
-import re
-from collections import Counter
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
-from sklearn.decomposition import IncrementalPCA
-from transformers import AutoTokenizer, AutoModel
-import gc
 import warnings
 import spacy
 warnings.filterwarnings('ignore')
 
-# Import standardized format
-from data_format import AcademicDataset, validate_dataset_format
-
 # Import PPTM modules (from GitHub repo)
 from utils import *
-from topic_score import Topic_SCORE
 from embedded_score import Embedded_SCORE_C
 
 # Import transformer libraries
@@ -44,10 +32,7 @@ except ImportError:
     print("⚠ Warning: transformers not available. Install with: pip install torch transformers")
 
 from typing import List
-import numpy as np
-from itertools import compress
 import gc
-from collections import Counter
 from bert_embeddings import *
 from vocab_cleaning import clean_vocabulary, drop_short_documents
 
@@ -135,9 +120,13 @@ class TopicSpecificBTL:
         n_journals: int,
         reg_lambda: float = 0,
         use_debiased: bool = False,
-        step_size: float = 50,
-        max_iter: int = 20000,
+        step_size: float = 100,
+        max_iter: int = 5000,
         tol: float = 1e-6,
+        L_matrix = None,
+        Sigma_delta_w = None,
+        frequencies = None,
+        doc_lens = None
     ):
         self.K = int(n_topics)
         self.M = int(n_journals)
@@ -147,6 +136,10 @@ class TopicSpecificBTL:
         self.step_size = float(step_size)
         self.max_iter = int(max_iter)
         self.tol = float(tol)
+        self.L_matrix = L_matrix
+        self.Sigma_delta_w = Sigma_delta_w
+        self.frequencies = frequencies
+        self.doc_lens = doc_lens
 
         self.S: Optional[np.ndarray] = None  # (M × K)
 
@@ -297,22 +290,6 @@ class TopicSpecificBTL:
         #    "Average Gradient per Citation". This prevents explosion.
         grad /= n_edges
         
-        # B. Add L2 Regularization Gradient
-        # Derivative of (lambda * sum(S^2)) is (2 * lambda * S)
-        # We DO NOT divide this by n_edges, to keep regularization strong.
-        # (Since we are minimizing NLL, we *add* the gradient of the penalty,
-        #  but since we return -grad at the end, we subtract it here).
-        
-        # NOTE: The objective is J = - (LogLikelihood/N) + Lambda * |S|^2
-        # Gradient of LogLikelihood part is 'grad' (positive ascent direction).
-        # Gradient of Penalty is 2*lambda*S.
-        # We want to MINIMIZE J.
-        # Grad_J = - (grad_LL) + 2*lambda*S
-        
-        # Since 'grad' currently holds the ascent direction (dLL/dS), 
-        # the descent direction is -grad.
-        # So we can just construct the total gradient for minimization directly:
-        
         total_grad = -grad + (2.0 * self.reg_lambda * S)
         
         return total_grad.flatten()
@@ -349,71 +326,13 @@ class TopicSpecificBTL:
     # Debiased gradient (ONLY C_data^[0] implemented)
     # ------------------------------------------------------------------
 
-    # def _debiased_gradient_C0(
-    #     self,
-    #     S: np.ndarray,                        # (M, K)
-    #     citation_pairs,                       # list of (i, j)
-    #     topic_weights: np.ndarray,            # (n, K)
-    #     journal_ids: np.ndarray,              # (n,)
-    #     Sigma_delta_w: np.ndarray,            # (n, K, K)  <-- CHANGED TYPE
-    # ) -> np.ndarray:
-    #     """
-    #     Implements C_data^[0] using full covariance matrices.
-    #     """
-    #     grad = np.zeros_like(S, dtype=float)
-    #     C0   = np.zeros_like(S, dtype=float)
-
-    #     mu = self._compute_paper_scores(S, topic_weights, journal_ids)
-
-    #     for i, j in citation_pairs:
-    #         ji = int(journal_ids[i])
-    #         jj = int(journal_ids[j])
-
-    #         if ji < 0 or jj < 0 or ji >= self.M or jj >= self.M:
-    #             continue
-
-    #         delta = mu[i] - mu[j]
-    #         p     = self._sigmoid(delta)
-    #         alpha = self._sigmoid_prime(delta)
-
-    #         # Standard Gradient
-    #         # Penalize the citing journal (i)
-    #         grad[ji] -= p * topic_weights[i]
-            
-    #         # Reward the cited journal (j)
-    #         grad[jj] += p * topic_weights[j]
-
-    #         # --------------------------------------------------------
-    #         # C_data^[0] correction
-    #         #
-    #         # Σ_{δw,i} S(π_i π_iᵀ) simplifies to:
-    #         # Vector = Σ_{δw,i} @ S[ji]
-    #         # (Matrix-Vector multiplication: (K,K) @ (K,) -> (K,))
-    #         # --------------------------------------------------------
-            
-    #         # Correction for i
-    #         correction_i = Sigma_delta_w[i] @ S[ji]
-    #         C0[ji] += alpha * correction_i
-    #         #C0[ji] -= alpha * correction_i
-
-    #         # Correction for j
-    #         correction_j = Sigma_delta_w[j] @ S[jj]
-    #         C0[jj] += alpha * correction_j
-    #         #C0[jj] -= alpha * correction_j
-
-    #     #grad -= 2.0 * self.reg_lambda * S
-    #     grad_star = grad - C0
-
-    #     return grad_star
-
-
     def _debiased_gradient_C0(
         self,
         S,                    # (M, K) numpy
         citation_pairs,       # list of (i, j)
         topic_weights,        # (n_docs, K) numpy
         journal_ids,          # (n_docs,) numpy
-        Sigma_delta_w,        # (n_docs, K, K) numpy
+        # Sigma_delta_w,        # (n_docs, K, K) numpy
         device='cuda',
     ):
         """
@@ -428,7 +347,7 @@ class TopicSpecificBTL:
         S_t = torch.tensor(S, dtype=torch.float64, device=device)
         tw_t = torch.tensor(topic_weights, dtype=torch.float64, device=device)
         jids_t = torch.tensor(journal_ids, dtype=torch.long, device=device)
-        Sig_t = torch.tensor(Sigma_delta_w, dtype=torch.float64, device=device)
+        Sig_t = torch.tensor(self.Sigma_delta_w, dtype=torch.float64, device=device)
         
         pairs = np.array(citation_pairs, dtype=int)
         i_idx_t = torch.tensor(pairs[:, 0], dtype=torch.long, device=device)
@@ -483,74 +402,125 @@ class TopicSpecificBTL:
         grad_star = grad - C0
         return grad_star.cpu().numpy()
 
-    # def _debiased_gradient_C0_VEC(
-    #     self,
-    #     S,                    # (M, K)
-    #     citation_pairs,       # list of (i, j) tuples
-    #     topic_weights,        # (n_docs, K)
-    #     journal_ids,          # (n_docs,)
-    #     Sigma_delta_w,        # (n_docs, K, K)
-    # ):
-    #     """
-    #     Vectorized C0 debiased gradient for journal citations.
-    #     Replaces the slow per-citation Python loop.
-    #     """
-    #     # Convert to arrays
-    #     pairs = np.array(citation_pairs, dtype=int)
-    #     i_idx = pairs[:, 0]
-    #     j_idx = pairs[:, 1]
-    #     n_edges = len(i_idx)
-        
-    #     ji = journal_ids[i_idx]  # (n_edges,) journal of citing paper
-    #     jj = journal_ids[j_idx]  # (n_edges,) journal of cited paper
-        
-    #     # ------------------------------------------
-    #     # 1. Compute scores and sigmoid
-    #     # ------------------------------------------
-    #     mu = np.sum(topic_weights * S[journal_ids], axis=1)  # (n_docs,)
-    #     delta = mu[i_idx] - mu[j_idx]                         # (n_edges,)
-    #     p = self._sigmoid(delta)                               # (n_edges,)
-    #     alpha = p * (1.0 - p)                                  # (n_edges,)
-        
-    #     # ------------------------------------------
-    #     # 2. Standard MLE gradient (ascent direction)
-    #     # ------------------------------------------
-    #     grad = np.zeros_like(S)
-        
-    #     weighted_p_i = p[:, None] * topic_weights[i_idx]  # (n_edges, K)
-    #     weighted_p_j = p[:, None] * topic_weights[j_idx]  # (n_edges, K)
-        
-    #     np.add.at(grad, ji, -weighted_p_i)  # citing (loser)
-    #     np.add.at(grad, jj,  weighted_p_j)  # cited (winner)
-        
-    #     # ------------------------------------------
-    #     # 3. C0 correction (vectorized)
-    #     # ------------------------------------------
-    #     C0 = np.zeros_like(S)
-        
-    #     # correction_i = Sigma[i] @ S[ji]  for each edge
-    #     # Sigma[i_idx] has shape (n_edges, K, K)
-    #     # S[ji] has shape (n_edges, K)
-    #     S_ji = S[ji][:, :, None]                                    # (n_edges, K, 1)
-    #     correction_i = (Sigma_delta_w[i_idx] @ S_ji).squeeze(-1)    # (n_edges, K)
-        
-    #     S_jj = S[jj][:, :, None]                                    # (n_edges, K, 1)
-    #     correction_j = (Sigma_delta_w[j_idx] @ S_jj).squeeze(-1)    # (n_edges, K)
-        
-    #     weighted_corr_i = alpha[:, None] * correction_i  # (n_edges, K)
-    #     weighted_corr_j = alpha[:, None] * correction_j  # (n_edges, K)
-        
-    #     np.add.at(C0, ji, weighted_corr_i)
-    #     np.add.at(C0, jj, weighted_corr_j)
-        
-    #     # ------------------------------------------
-    #     # 4. Combine
-    #     # ------------------------------------------
-    #     grad_star = grad - C0
-        
-    #     return grad_star
+    def _debiased_gradient_all(
+        self,
+        S,
+        citation_pairs,
+        topic_weights,
+        journal_ids,
+        device='cuda'
+    ):
+        if not torch.cuda.is_available() and device == 'cuda':
+            device = 'cpu'
 
+        # Convert inputs to tensors
+        S_t = torch.tensor(S, dtype=torch.float64, device=device)
+        tw_t = torch.tensor(topic_weights, dtype=torch.float64, device=device)
+        jids_t = torch.tensor(journal_ids, dtype=torch.long, device=device)
+        Sig_t = torch.tensor(self.Sigma_delta_w, dtype=torch.float64, device=device)
+        L_t = torch.tensor(self.L_matrix, dtype=torch.float64, device=device)
+        freq_t = torch.tensor(self.frequencies, dtype=torch.float64, device=device)
+        dlen_t = torch.tensor(self.doc_lens, dtype=torch.float64, device=device)
+        
+        pairs = np.array(citation_pairs, dtype=int)
+        i_idx = torch.tensor(pairs[:, 0], dtype=torch.long, device=device)
+        j_idx = torch.tensor(pairs[:, 1], dtype=torch.long, device=device)
+        
+        ji_t, jj_t = jids_t[i_idx], jids_t[j_idx]
+        M, K = S.shape
 
+        # ------------------------------------------------------------
+        # 1. Predictions and Derivatives
+        # ------------------------------------------------------------
+        mu = (tw_t * S_t[jids_t]).sum(dim=1)
+        delta = mu[i_idx] - mu[j_idx]
+        p = torch.sigmoid(delta)
+        alpha = p * (1.0 - p)
+        beta = alpha * (1.0 - 2.0 * p)  # Second derivative sigma''
+
+        # ------------------------------------------------------------
+        # 2. C0 Correction & Basic Gradient
+        # ------------------------------------------------------------
+        # (Existing C0 logic...)
+        grad = torch.zeros(M, K, dtype=torch.float64, device=device)
+        grad.scatter_add_(0, ji_t.unsqueeze(1).expand(-1, K), -(p.unsqueeze(1) * tw_t[i_idx]))
+        grad.scatter_add_(0, jj_t.unsqueeze(1).expand(-1, K),  (p.unsqueeze(1) * tw_t[j_idx]))
+
+        S_ji = S_t[ji_t].unsqueeze(-1)
+        corr_i = (Sig_t[i_idx] @ S_ji).squeeze(-1)
+        S_jj = S_t[jj_t].unsqueeze(-1)
+        corr_j = (Sig_t[j_idx] @ S_jj).squeeze(-1)
+
+        C0 = torch.zeros(M, K, dtype=torch.float64, device=device)
+        C0.scatter_add_(0, ji_t.unsqueeze(1).expand(-1, K), alpha.unsqueeze(1) * corr_i)
+        C0.scatter_add_(0, jj_t.unsqueeze(1).expand(-1, K), alpha.unsqueeze(1) * corr_j)
+
+        # ------------------------------------------------------------
+        # 3. C1 Correction
+        # ------------------------------------------------------------
+        # Compute V_i = v_i^T Sigma_i v_i for all docs
+        # Using v = S[jids_t]
+        v_all = S_t[jids_t]
+        V_all = torch.bmm(v_all.unsqueeze(1), torch.bmm(Sig_t, v_all.unsqueeze(2))).squeeze() # (n_docs,)
+        
+        # Compute g_hat vectors
+        ghat_all = self._compute_ghat_gpu(S_t, tw_t, jids_t, L_t, freq_t, dlen_t) # (n_docs, K)
+
+        C1 = torch.zeros(M, K, dtype=torch.float64, device=device)
+        
+        # Term: 0.5 * beta * [ (Vi + Vj)*(wi*pi' - wj*pj') + (gi*pi' - gj*pj') ]
+        # Contribution to Row i (ji_t): 0.5 * beta * ((Vi+Vj)*wi + gi)
+        # Contribution to Row j (jj_t): -0.5 * beta * ((Vi+Vj)*wj + gj)
+        
+        V_sum = V_all[i_idx] + V_all[j_idx]
+        
+        c1_i = 0.5 * beta.unsqueeze(1) * (V_sum.unsqueeze(1) * tw_t[i_idx] + ghat_all[i_idx])
+        c1_j = 0.5 * beta.unsqueeze(1) * (V_sum.unsqueeze(1) * tw_t[j_idx] + ghat_all[j_idx])
+        
+        C1.scatter_add_(0, ji_t.unsqueeze(1).expand(-1, K), c1_i)
+        C1.scatter_add_(0, jj_t.unsqueeze(1).expand(-1, K), -c1_j)
+
+        # ------------------------------------------------------------
+        # 4. Combine
+        # ------------------------------------------------------------
+        grad_star = grad - C0 - C1
+        return grad_star.cpu().numpy()
+    
+    def _compute_ghat_gpu(self, S_t, tw_t, jids_t, L_t, freq_t, doc_lens_t):
+        """
+        Computes g_hat_i = L * h_hat_i for all docs on GPU.
+        g_hat_i is a (K,) vector per document.
+        """
+        # S_t: (M, K), tw_t: (n_docs, K), jids_t: (n_docs,)
+        # L_t: (K, V), freq_t: (V, n_docs), doc_lens_t: (n_docs,)
+        
+        # 1. Get the S row for each document: v_i = S[journal_i]
+        v = S_t[jids_t]  # (n_docs, K)
+        
+        # 2. Map S rows back to word space: q = L.T @ v.T
+        # q_i is the weight vector in word space: (V, n_docs)
+        q = torch.mm(L_t.t(), v.t()) 
+        
+        # 3. Intermediate terms for Multinomial 3rd moment
+        # p is freq_t: (V, n_docs)
+        p_dot_q = (freq_t * q).sum(dim=0)          # (n_docs,) - equivalent to (tw_t * v).sum(1)
+        p_dot_q2 = (freq_t * (q**2)).sum(dim=0)      # (n_docs,)
+        
+        # 4. Construct the vector z_i (size V) for each doc
+        # z_r = p_r*q_r^2 - 2*p_r*q_r*(p.q) - p_r*(p.q^2) + 2*p_r*(p.q)^2
+        term1 = freq_t * (q**2)                               # (V, n_docs)
+        term2 = 2 * (freq_t * q) * p_dot_q.unsqueeze(0)       # (V, n_docs)
+        term3 = freq_t * p_dot_q2.unsqueeze(0)                # (V, n_docs)
+        term4 = 2 * freq_t * (p_dot_q**2).unsqueeze(0)        # (V, n_docs)
+        
+        z = (term1 - term2 - term3 + term4)                   # (V, n_docs)
+        
+        # 5. Final contraction with L and scaling by 1/N^2
+        # g_i = (1/N^2) * L @ z_i
+        ghat = torch.mm(L_t, z)                               # (K, n_docs)
+        ghat = ghat / (doc_lens_t**2).unsqueeze(0)
+        
+        return ghat.t()  # (n_docs, K)
     # ------------------------------------------------------------------
     # Main fit
     # ------------------------------------------------------------------
@@ -560,7 +530,6 @@ class TopicSpecificBTL:
         citation_matrix: sp.csr_matrix,
         topic_weights: np.ndarray,          # W_hat, shape (n_docs, K)
         journal_ids: np.ndarray,             # shape (n_docs,)
-        Sigma_delta_w: np.ndarray = None,  # shape (N, K, K)
         verbose: bool = True,
     ):
         """
@@ -590,38 +559,6 @@ class TopicSpecificBTL:
             print(f"  • journals = {self.M}, topics = {self.K}")
             print(f"  • citations = {n_edges:,}")
             print(f"  • mode = {'DEBIASED PGD' if self.use_debiased else 'MLE (L-BFGS)'}")
-
-        # ============================================================
-        # Case 1 — Classical MLE (unchanged)
-        # ============================================================
-        # if not self.use_debiased:
-        #     S0 = np.random.normal(0, 0.1, (self.M, self.K))
-        #     S0 = self._project(S0)
-        #     # Prepare arrays outside the minimization loop
-        #     citation_pairs_arr = np.array(citation_pairs)
-        #     i_indices = citation_pairs_arr[:, 0]
-        #     j_indices = citation_pairs_arr[:, 1]
-            
-
-        #     result = minimize(
-        #         self._negative_log_likelihood,
-        #         S0.flatten(),
-        #         # Pass the arrays, not the list of tuples
-        #         args=(i_indices, j_indices, topic_weights, journal_ids),
-        #         method="L-BFGS-B",
-        #         jac=self._mle_gradient,  # <--- PASS THE GRADIENT HERE!
-        #         options={"maxiter": self.max_iter, "ftol": 1e-9},
-        #     )
-            
-        #     self.S = self._project(result.x.reshape(self.M, self.K))
-
-        #     if verbose:
-        #         print("✓ MLE optimization completed")
-        #         print(f"  success = {result.success}")
-        #         print(f"  final NLL = {result.fun:.4f}")
-
-        #     return self
-
 
 
         # --- Momentum Projected Gradient Descent (MLE case) ---
@@ -726,38 +663,35 @@ class TopicSpecificBTL:
                     print("✓ MLE (iterative) completed")
                 return self
 
-        
-
         # ============================================================
         # Case 2 — Debiased Projected Gradient Descent
         # ============================================================
 
-        # ---------------------------
-        # Sanity checks
-        # ---------------------------
-        if Sigma_delta_w is None:
+        
+        if self.Sigma_delta_w is None:
             raise ValueError(
                 "Sigma_delta_w must be provided for debiased fitting "
                 "(implements C_data^{[0]})"
             )
 
-        if Sigma_delta_w.ndim != 3 or Sigma_delta_w.shape[0] != len(journal_ids):
-                raise ValueError(f"Sigma_delta_w must be (n_docs, K, K). Got {Sigma_delta_w.shape}")
+        if self.Sigma_delta_w.ndim != 3 or self.Sigma_delta_w.shape[0] != len(journal_ids):
+                raise ValueError(f"Sigma_delta_w must be (n_docs, K, K). Got {self.Sigma_delta_w.shape}")
 
         # ---------------------------
         # Initialization of S
         # ---------------------------
         S = np.random.normal(0, 0.1, (self.M, self.K))
         S = self._project(S)
-
-        # ============================================================
-        # Main PGD loop
-        # ============================================================
+        
         # ============================================================
         # Main PGD loop
         # ============================================================
         for t in range(self.max_iter):
-            # 1. Compute debiased gradient (The "Score")
+
+            velocity = np.zeros_like(S)
+            beta = 0.9  # Common momentum value
+
+            # Inside the loop
             # grad = self._debiased_gradient_C0(
             #     S=S,
             #     citation_pairs=citation_pairs,
@@ -765,23 +699,12 @@ class TopicSpecificBTL:
             #     journal_ids=journal_ids,
             #     Sigma_delta_w=Sigma_delta_w,
             # )
-
-            # # 2. Update Step
-            # # Note: We divide by n_edges to keep the scale consistent 
-            # # regardless of dataset size, similar to a mean gradient.
-            # step = self.step_size * grad / n_edges
-            # S_new = self._project(S + step)
-            # Before the loop
-            velocity = np.zeros_like(S)
-            beta = 0.9  # Common momentum value (0.9 means 90% of speed is kept)
-
-            # Inside the loop
-            grad = self._debiased_gradient_C0(
+            grad = self._debiased_gradient_all(
                 S=S,
                 citation_pairs=citation_pairs,
                 topic_weights=topic_weights,
                 journal_ids=journal_ids,
-                Sigma_delta_w=Sigma_delta_w,
+                device='cuda'
             )
             # Update velocity
             velocity = beta * velocity + (1 - beta) * (grad / n_edges)
@@ -847,6 +770,7 @@ class TopicSpecificBTL:
             reg = self.reg_lambda * np.sum(S**2)
             return (total_nll / n_battles) + reg
 
+
     def _mle_gradient_battles(self, S_flat, model_A_ids, model_B_ids, winners, topic_weights):
         """
         Computes the gradient of NLL w.r.t S for Battles.
@@ -855,7 +779,6 @@ class TopicSpecificBTL:
         S = S_flat.reshape(self.M, self.K)
         n_battles = len(winners)
         grad = np.zeros_like(S)
-        self.reg_lambda = 0
 
         # 1. Scores
         mu_A = np.sum(topic_weights * S[model_A_ids], axis=1)
@@ -987,26 +910,6 @@ class TopicSpecificBTL:
         # ============================================================
         # Case 1: Standard MLE (L-BFGS-B)
         # ============================================================
-        # if not self.use_debiased:
-        #     #S0 = np.ones((self.M, self.K))
-        #     S0 = np.random.normal(0, 0.1, (self.M, self.K))
-        #     S0 = self._project_llmarena(S0)
-
-        #     result = minimize(
-        #         fun=self._negative_log_likelihood_battles,
-        #         x0=S0.flatten(),
-        #         args=(model_A_ids, model_B_ids, winners, topic_weights),
-        #         method="L-BFGS-B",
-        #         jac=self._mle_gradient_battles,
-        #         options={"maxiter": self.max_iter, "ftol": self.tol}
-        #     )
-        
-        #     self.S = self._project_llmarena(result.x.reshape(self.M, self.K))
-
-    
-        #     if verbose:
-        #         print(f"   ✓ Optimization Converged: {result.success}, Loss: {result.fun:.4f}")
-        #     return self
         if not self.use_debiased:
             S = np.random.normal(0, 0.1, (self.M, self.K))
             S = self._project_llmarena(S)
@@ -1090,6 +993,7 @@ class TopicSpecificBTL:
         if verbose: print("   ✓ Debiased PGD completed")
         return self
 
+
     def get_journal_rankings(self, topic_distribution: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
         """
         Get journal rankings for specific topic distribution
@@ -1114,7 +1018,8 @@ class TopicSpecificBTL:
         rankings = np.argsort(-journal_scores)
         
         return rankings, journal_scores
-    
+
+
     def get_topic_specific_rankings(self) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
         """
         Get rankings for each individual topic
@@ -1184,7 +1089,7 @@ class BTLPPTMAnalyzer:
             raw_texts = dataset.abstracts # Use abstracts for topic modeling
 
 
-        if deduplicate:
+        if deduplicate and is_battle_mode:
             if verbose: print(f"\nStep 0: Deduplicating {len(raw_texts)} texts...")
             
             # 1. Identify unique texts and their indices
@@ -1324,6 +1229,8 @@ class BTLPPTMAnalyzer:
 
         else:
             # === MADSTAT (Citation Network) ===
+            frequencies = self.pptm_model.model.hyperword_freq  # (V, n_docs)
+            doc_lens = self.pptm_model.model.doc_lens           # (n_docs,)
             n_journals = self.dataset.n_journals
             print(f"\nStep 4: Running Standard Citation BTL for {n_journals} journals...")
             
@@ -1331,14 +1238,24 @@ class BTLPPTMAnalyzer:
                 n_topics=self.n_topics,
                 n_journals=n_journals,
                 use_debiased=ENABLE_DEBIASING, 
+                Sigma_delta_w=Sigma_delta_w,
+                L_matrix = self.L_matrix,
+                frequencies = frequencies,
+                doc_lens = doc_lens,
                 reg_lambda=self.reg_lambda
             )
             
+            # self.btl_model.fit(
+            #     citation_matrix=self.dataset.citation_matrix,
+            #     topic_weights=self.topic_weights,
+            #     journal_ids=self.dataset.journal_ids,
+            #     Sigma_delta_w=Sigma_delta_w,
+            #     verbose=verbose
+            # )
             self.btl_model.fit(
                 citation_matrix=self.dataset.citation_matrix,
                 topic_weights=self.topic_weights,
                 journal_ids=self.dataset.journal_ids,
-                Sigma_delta_w=Sigma_delta_w,
                 verbose=verbose
             )
 
@@ -1422,6 +1339,9 @@ class BTLPPTMAnalyzer:
         G = A.T @ A
         G_inv = np.linalg.inv(G)
         B = A @ G_inv
+        # SAVE L_matrix here (L = B^T)
+        if not hasattr(self, 'L_matrix'):
+            self.L_matrix = B.T  # Shape (K, V)
 
         # ------------------------------------------------------------
         # Allocate output (N, K, K)
@@ -1460,7 +1380,6 @@ class BTLPPTMAnalyzer:
             # frequencies to counts in the numerator.
             # --------------------------------------------------------
             Sigma_delta_w[i] = (term1 - term2) / (N_i - 1)
-
         return Sigma_delta_w
 
 
