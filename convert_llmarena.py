@@ -77,10 +77,11 @@ def convert_llmarena_dataset(
     if verbose: print("[LLMArena] Loading dataset...")
     
     # 1. Load Data
-    ds = load_dataset("lmarena-ai/arena-human-preference-55k", split=split)
+    #ds = load_dataset("lmarena-ai/arena-human-preference-55k", split=split)
+    ds = load_dataset("lmarena-ai/arena-human-preference-140k", split=split)
     
     # 2. Filter Ties (Strict comparisons only)
-    ds = ds.filter(lambda r: r["winner_tie"] == 0)
+    #ds = ds.filter(lambda r: r["winner_tie"] == 0)
     
     # 3. Optional Subsampling
     if sample_size and sample_size < len(ds):
@@ -102,28 +103,97 @@ def convert_llmarena_dataset(
     model_b_ids = []
     winners = []
     
-    for r in ds:
-        prompt = clean_prompt(r["prompt"])
+    # for r in ds:
+    #     prompt = clean_prompt(r["prompt"])
         
-        # Skip bad/short/code prompts
+    #     # Skip bad/short/code prompts
+    #     if not is_good_prompt(prompt, min_words=min_prompt_words):
+    #         continue
+            
+    #     # Store Data
+    #     prompts.append(prompt)
+        
+    #     # Map model names to Integers (0 to M-1)
+    #     model_a_ids.append(model_to_id[r["model_a"]])
+    #     model_b_ids.append(model_to_id[r["model_b"]])
+        
+    #     # Determine Winner Index (0 for A, 1 for B)
+    #     # Dataset has 'winner_model_a': 1 if A won, 0 if B won
+    #     # Our target 'winners': 0 if A, 1 if B (Index of the winner in the pair)
+        
+    #     if r["winner_model_a"] == 1:
+    #         winners.append(0) # A wins
+    #     else:
+    #         winners.append(1) # B wins
+
+    for _, r in enumerate(ds):
+        if r.get("language") != "en":
+            continue
+        # try:
+        #     # 1. Access the first message of the conversation
+        #     # conversation_a[0] is the first turn (the user prompt)
+        #     first_turn = r["conversation_a"][0]
+            
+        #     # 2. Access the 'content' list and get the 'text' field
+        #     # We assume the first content item is the text prompt
+        #     prompt = first_turn["content"][0]["text"]
+
+        try:
+            # 1. Get the full conversation list
+            conv = r.get("full_conversation", [])
+            
+            # 2. Extract all text from turns where role is "user"
+            user_parts = []
+            for turn in conv:
+                turn = turn["user"]
+                if turn.get("role") == "user":
+                    # A turn's content is a list (could be text + image)
+                    # We collect all 'text' blocks within that turn
+                    for content_item in turn.get("content", []):
+                        if content_item.get("type") == "text":
+                            text = content_item.get("text", "").strip()
+                            if text:
+                                user_parts.append(text)
+            
+            # 3. Join with a space (or newline) to create one large prompt
+            prompt_raw = " ".join(user_parts)
+            
+            # 4. Clean and validate as before
+            prompt = clean_prompt(prompt_raw)
+            if not is_good_prompt(prompt, min_words=min_prompt_words):
+                continue
+            
+        except (KeyError, IndexError, TypeError):
+            # Fallback or skip if the structure is unexpected
+            continue
+
+        # Skip bad/short prompts using your existing filter
         if not is_good_prompt(prompt, min_words=min_prompt_words):
             continue
             
-        # Store Data
         prompts.append(prompt)
-        
-        # Map model names to Integers (0 to M-1)
         model_a_ids.append(model_to_id[r["model_a"]])
         model_b_ids.append(model_to_id[r["model_b"]])
         
-        # Determine Winner Index (0 for A, 1 for B)
-        # Dataset has 'winner_model_a': 1 if A won, 0 if B won
-        # Our target 'winners': 0 if A, 1 if B (Index of the winner in the pair)
-        
-        if r["winner_model_a"] == 1:
-            winners.append(0) # A wins
+        # Winner logic for the 140k/new datasets:
+        # These usually use a single 'winner' column with strings
+        if "winner" in r:
+            if r["winner"] == "model_a":
+                winners.append(0)
+            elif r["winner"] == "model_b":
+                winners.append(1)
+            else:
+                # This handles ties by popping the last prompt added
+                prompts.pop()
+                model_a_ids.pop()
+                model_b_ids.pop()
+                continue
         else:
-            winners.append(1) # B wins
+            # Fallback for the older 55k format if needed
+            if r.get("winner_model_a") == 1:
+                winners.append(0)
+            else:
+                winners.append(1)
 
     # 6. Convert to Numpy
     dataset = BattleDataset(
@@ -141,6 +211,3 @@ def convert_llmarena_dataset(
 
 if __name__ == "__main__":
     ds = convert_llmarena_dataset(sample_size=5000)
-    # You can now save this object with pickle or use it directly
-    # with open("llm_battles.pkl", "wb") as f:
-    #     pickle.dump(ds, f)
