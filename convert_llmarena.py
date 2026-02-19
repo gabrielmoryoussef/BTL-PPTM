@@ -129,39 +129,39 @@ def convert_llmarena_dataset(
     for _, r in enumerate(ds):
         if r.get("language") != "en":
             continue
-        # try:
-        #     # 1. Access the first message of the conversation
-        #     # conversation_a[0] is the first turn (the user prompt)
-        #     first_turn = r["conversation_a"][0]
-            
-        #     # 2. Access the 'content' list and get the 'text' field
-        #     # We assume the first content item is the text prompt
-        #     prompt = first_turn["content"][0]["text"]
-
         try:
-            # 1. Get the full conversation list
-            conv = r.get("full_conversation", [])
+            # 1. Access the first message of the conversation
+            # conversation_a[0] is the first turn (the user prompt)
+            first_turn = r["conversation_a"][0]
             
-            # 2. Extract all text from turns where role is "user"
-            user_parts = []
-            for turn in conv:
-                turn = turn["user"]
-                if turn.get("role") == "user":
-                    # A turn's content is a list (could be text + image)
-                    # We collect all 'text' blocks within that turn
-                    for content_item in turn.get("content", []):
-                        if content_item.get("type") == "text":
-                            text = content_item.get("text", "").strip()
-                            if text:
-                                user_parts.append(text)
+            # 2. Access the 'content' list and get the 'text' field
+            # We assume the first content item is the text prompt
+            prompt = first_turn["content"][0]["text"]
+
+        # try:
+        #     # 1. Get the full conversation list
+        #     conv = r.get("full_conversation", [])
             
-            # 3. Join with a space (or newline) to create one large prompt
-            prompt_raw = " ".join(user_parts)
+        #     # 2. Extract all text from turns where role is "user"
+        #     user_parts = []
+        #     for turn in conv:
+        #         turn = turn["user"]
+        #         if turn.get("role") == "user":
+        #             # A turn's content is a list (could be text + image)
+        #             # We collect all 'text' blocks within that turn
+        #             for content_item in turn.get("content", []):
+        #                 if content_item.get("type") == "text":
+        #                     text = content_item.get("text", "").strip()
+        #                     if text:
+        #                         user_parts.append(text)
             
-            # 4. Clean and validate as before
-            prompt = clean_prompt(prompt_raw)
-            if not is_good_prompt(prompt, min_words=min_prompt_words):
-                continue
+        #     # 3. Join with a space (or newline) to create one large prompt
+        #     prompt_raw = " ".join(user_parts)
+            
+        #     # 4. Clean and validate as before
+        #     prompt = clean_prompt(prompt_raw)
+        #     if not is_good_prompt(prompt, min_words=min_prompt_words):
+        #         continue
             
         except (KeyError, IndexError, TypeError):
             # Fallback or skip if the structure is unexpected
@@ -195,13 +195,40 @@ def convert_llmarena_dataset(
             else:
                 winners.append(1)
 
-    # 6. Convert to Numpy
+    # --- PRUNE UNUSED MODELS & REMAP IDS (IMPORTANT)
+    model_a_ids = np.array(model_a_ids, dtype=int)
+    model_b_ids = np.array(model_b_ids, dtype=int)
+    winners = np.array(winners, dtype=int)
+
+    used_old_ids = np.unique(np.concatenate([model_a_ids, model_b_ids]))
+    used_old_ids.sort()
+
+    # old_id -> new_id mapping
+    old_to_new = -np.ones(len(unique_models), dtype=int)
+    old_to_new[used_old_ids] = np.arange(len(used_old_ids))
+
+    # remap match arrays
+    model_a_ids = old_to_new[model_a_ids]
+    model_b_ids = old_to_new[model_b_ids]
+
+    # shrink names to only those actually used
+    unique_models_used = [unique_models[i] for i in used_old_ids]
+
+    # # 6. Convert to Numpy
+    # dataset = BattleDataset(
+    #     prompts=prompts,
+    #     model_a_ids=np.array(model_a_ids, dtype=int),
+    #     model_b_ids=np.array(model_b_ids, dtype=int),
+    #     winners=np.array(winners, dtype=int),
+    #     journal_names=unique_models
+    # )
+
     dataset = BattleDataset(
         prompts=prompts,
-        model_a_ids=np.array(model_a_ids, dtype=int),
-        model_b_ids=np.array(model_b_ids, dtype=int),
-        winners=np.array(winners, dtype=int),
-        journal_names=unique_models
+        model_a_ids=model_a_ids,
+        model_b_ids=model_b_ids,
+        winners=winners,
+        journal_names=unique_models_used
     )
 
     if verbose:
