@@ -271,6 +271,36 @@ def fit_classic_btl_llmarena(dataset, alpha_ci=0.05, print_counts=True, top_k=No
 
     theta = choix.ilsr_pairwise(M, pairs, alpha=0.01)
     theta -= theta.mean()
+    # counts = np.zeros(M, dtype=int)
+    # wins = np.zeros(M, dtype=int)
+    # losses = np.zeros(M, dtype=int)
+
+    # for w, l in pairs:
+    #     counts[w] += 1
+    #     counts[l] += 1
+    #     wins[w] += 1
+    #     losses[l] += 1
+
+    # print("\n[MADStat BTL] Comparisons per journal (top/bottom 10):")
+    # order_counts = np.argsort(-counts)
+    # topk = min(10, M)
+    # for i in order_counts[:topk]:
+    #     print(f"  {dataset.journal_names[i]:<10s}  comps={counts[i]:6d}  wins={wins[i]:6d}  losses={losses[i]:6d}")
+    # print("  ...")
+    # for i in order_counts[-topk:][::-1]:
+    #     print(f"  {dataset.journal_names[i]:<10s}  comps={counts[i]:6d}  wins={wins[i]:6d}  losses={losses[i]:6d}")
+
+    # # ---- 2) Win rate sanity (catch near-separation)
+    # with np.errstate(divide='ignore', invalid='ignore'):
+    #     win_rate = wins / np.maximum(1, wins + losses)
+
+    # extreme = np.where((wins + losses) > 0)[0]
+    # extreme = extreme[(win_rate[extreme] < 0.05) | (win_rate[extreme] > 0.95)]
+    # if len(extreme) > 0:
+    #     print("\n[MADStat BTL] Journals with extreme win rate (<5% or >95%):")
+    #     for i in extreme:
+    #         print(f"  {dataset.journal_names[i]:<10s}  win_rate={win_rate[i]:.3f}  (wins={wins[i]}, losses={losses[i]})")
+
 
     # 2. Compute Fisher information matrix
     Fisher = np.zeros((M, M))
@@ -286,7 +316,7 @@ def fit_classic_btl_llmarena(dataset, alpha_ci=0.05, print_counts=True, top_k=No
         Fisher[loser, winner]  -= info
 
     # 3. Ridge to address singularity
-    Fisher += 0.01 * np.eye(M)
+    Fisher += (1.0 / M) * np.ones((M, M))
 
     # 4. Covariance + SE
     Cov = np.linalg.inv(Fisher)
@@ -298,46 +328,6 @@ def fit_classic_btl_llmarena(dataset, alpha_ci=0.05, print_counts=True, top_k=No
     ci_upper = theta + z * se
 
     return theta, ci_lower, ci_upper, se
-
-# def fit_classic_btl_llmarena(dataset):
-#     pairs = []
-#     for a, b, w in zip(
-#         dataset.model_a_ids,
-#         dataset.model_b_ids,
-#         dataset.winners
-#     ):
-#         if w == 0:
-#             pairs.append((a, b))
-#         else:
-#             pairs.append((b, a))
-
-#     print("pairs = ", pairs[:100])
-
-#     theta = choix.ilsr_pairwise(
-#         len(dataset.journal_names),
-#         pairs,
-#         alpha=0.01
-#     )
-#     theta -= theta.mean()   # identifiability
-#     return theta
-
-# def fit_classic_btl_madstat(dataset):
-#     C = dataset.citation_matrix.tocoo()
-#     pairs = []
-
-#     for i, j in zip(C.row, C.col):
-#         ji = dataset.journal_ids[i]
-#         jj = dataset.journal_ids[j]
-#         if ji != jj:
-#             pairs.append((jj, ji))  # cited beats citing
-
-#     theta = choix.ilsr_pairwise(
-#         len(dataset.journal_names),
-#         pairs
-#     )
-#     theta -= theta.mean()
-#     return theta
-
 
 
 def fit_classic_btl_madstat(dataset, alpha_ci=0.05):
@@ -366,7 +356,7 @@ def fit_classic_btl_madstat(dataset, alpha_ci=0.05):
             pairs.append((jj, ji))  # cited beats citing
     
     print(f"Number of citation pairs: {len(pairs)}")
-    
+
     # 2. Fit point estimates
     theta = choix.ilsr_pairwise(M, pairs)
     theta -= theta.mean()
@@ -385,7 +375,8 @@ def fit_classic_btl_madstat(dataset, alpha_ci=0.05):
         Fisher[loser, winner]  -= info
     
     # 4. Regularize (Fisher is singular due to identifiability)
-    Fisher += 0.01 * np.eye(M)
+    # Fisher += 0.01 * np.eye(M)
+    Fisher += (1.0 / M) * np.ones((M, M))
     
     # 5. Invert to get covariance
     Cov = np.linalg.inv(Fisher)
@@ -395,7 +386,24 @@ def fit_classic_btl_madstat(dataset, alpha_ci=0.05):
     z = norm.ppf(1 - alpha_ci / 2)
     ci_lower = theta - z * se
     ci_upper = theta + z * se
-    
+
+    # # ---- 3) Widest confidence intervals / largest SE
+    # ci_width = ci_upper - ci_lower
+    # order_se = np.argsort(-se)
+
+    # print("\n[MADStat BTL] Largest SE / widest CI (top 10):")
+    # topk = min(10, M)
+    # for i in order_se[:topk]:
+    #     print(f"  {dataset.journal_names[i]:<10s}  se={se[i]:.3f}  CI=[{ci_lower[i]:.2f}, {ci_upper[i]:.2f}]  width={ci_width[i]:.2f}  comps={counts[i]}")
+  
+    # # ---- 4) Fisher conditioning / near-singularity
+    # eigvals = np.linalg.eigvalsh(Fisher)
+    # print("\n[MADStat BTL] Fisher eigenvalues (min/median/max): "
+    #       f"{eigvals.min():.3e} / {np.median(eigvals):.3e} / {eigvals.max():.3e}")
+
+    # # condition number (can be huge if ill-conditioned)
+    # cond = eigvals.max() / max(eigvals.min(), 1e-12)
+    # print(f"[MADStat BTL] Fisher condition number (approx): {cond:.3e}")
     return theta, ci_lower, ci_upper, se
 
 # ======================================================================
