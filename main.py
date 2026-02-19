@@ -12,7 +12,6 @@ FIXED VERSION - Shows actual topic words instead of artificial names
 
 import numpy as np
 import pandas as pd
-from typing import Dict
 
 # Import our modules
 from madstat_converter import convert_madstat_dataset
@@ -79,20 +78,47 @@ def run_madstat_analysis(args):
         print(f"❌ Error loading MADStat: {e}")
         return None
     
+    
     if args.model == "btl":
         print("\nStep 3: Fitting BTL only model...")
-        theta = fit_classic_btl_madstat(dataset)
-        order = np.argsort(-theta)   # indices sorted by descending theta
+
+        # Fit BTL and get uncertainty
+        theta, ci_lower, ci_upper, se = fit_classic_btl_madstat(dataset)
+
+        # Order from strongest -> weakest (descending theta)
+        order = np.argsort(-theta)
+
+        # Sorted outputs
+        models_sorted = [dataset.journal_names[i] for i in order]
+        theta_sorted  = theta[order]
+        lo_sorted     = ci_lower[order]
+        hi_sorted     = ci_upper[order]
+        se_sorted     = se[order] if se is not None else None
+
+        # Save ranking table (now includes CI + SE)
         ranking_df = pd.DataFrame({
-            "rank": np.arange(1, len(theta) + 1),
-            "model": [dataset.journal_names[i] for i in order],
-            "theta": theta[order]
+            "rank": np.arange(1, len(theta_sorted) + 1),
+            "model": models_sorted,
+            "theta": theta_sorted,
+            "ci_lower": lo_sorted,
+            "ci_upper": hi_sorted,
+            "se": se_sorted
         })
+
         print("Saving ranking from simple BTL ...")
-        ranking_df.to_csv("Madstat_btl_ranking.csv", index=False)
+        ranking_df.to_csv("MADStat_btl_ranking.csv", index=False)
         print("Rankings saved!")
-        print("Saving strength parameter vizualisation!")
-        plot_btl([dataset.journal_names[i] for i in order], theta[order], save_path="ranking_simple_btl_madstat.png")
+
+        # Plot: ordered x-axis + theta point + CI whiskers
+        print("Saving strength parameter visualization (with CI)...")
+        plot_btl(
+            models_sorted,
+            theta_sorted,
+            ci_lower=lo_sorted,
+            ci_upper=hi_sorted,
+            title="MADStat BTL Strength (95% CI)",
+            save_path="ranking_simple_btl_madstat_ci.png"
+        )
 
     else:
         print("\nStep 2: Initializing BTL-PPTM model...")
@@ -259,25 +285,52 @@ def run_llmarena_analysis(args):
     print("\nStep 2: Initializing BTL-PPTM model...")
     if args.model == "btl":
         print("\nStep 3: Fitting BTL only model...")
-        theta = fit_classic_btl_llmarena(dataset)
-        order = np.argsort(-theta)   # indices sorted by descending theta
+
+        # Fit BTL and get uncertainty
+        theta, ci_lower, ci_upper, se = fit_classic_btl_llmarena(dataset)
+
+        # Order from strongest -> weakest (descending theta)
+        order = np.argsort(-theta)
+
+        # Sorted outputs
+        models_sorted = [dataset.journal_names[i] for i in order]
+        theta_sorted  = theta[order]
+        lo_sorted     = ci_lower[order]
+        hi_sorted     = ci_upper[order]
+        se_sorted     = se[order] if se is not None else None
+
+        # Save ranking table (now includes CI + SE)
         ranking_df = pd.DataFrame({
-            "rank": np.arange(1, len(theta) + 1),
-            "model": [dataset.journal_names[i] for i in order],
-            "theta": theta[order]
+            "rank": np.arange(1, len(theta_sorted) + 1),
+            "model": models_sorted,
+            "theta": theta_sorted,
+            "ci_lower": lo_sorted,
+            "ci_upper": hi_sorted,
+            "se": se_sorted
         })
+
         print("Saving ranking from simple BTL ...")
         ranking_df.to_csv("Llmarena_btl_ranking.csv", index=False)
         print("Rankings saved!")
-        print("Saving strength parameter vizualisation!")
-        plot_btl([dataset.journal_names[i] for i in order], theta[order], save_path="ranking_simple_btl_llmarena.png")
+
+        # Plot: ordered x-axis + theta point + CI whiskers
+        print("Saving strength parameter visualization (with CI)...")
+        plot_btl(
+            models_sorted,
+            theta_sorted,
+            ci_lower=lo_sorted,
+            ci_upper=hi_sorted,
+            title="LLM Arena BTL Strength (95% CI)",
+            save_path="ranking_simple_btl_llmarena_ci.png"
+        )
+    
     else:
         print("🤖 Running Topic Specific BTL model")
         print("=" * 40)
         analyzer = BTLPPTMAnalyzer(
             n_topics=12,                # good default for LM prompts
             n_hyperwords=2000,
-            embed_dim=30,
+            embed_dim=100,
             model_name='distilbert-base-uncased',
             reg_lambda=0.0,
             debiased=args.debiased,
@@ -411,17 +464,17 @@ def run_llmarena_analysis(args):
             # }
             topic_labels = {
                 0: "Mathematics & Number Theory",
-                1: "Code Debugging & Language Syntax",
-                2: "Biology & Molecular Science",
-                3: "Food, Cooking & Nutrition",
-                4: "Finance, Investing & Economics",
-                5: "Cars, Vehicles & Motorsport",
-                6: "Image Generation & Character Description",
-                7: "DevOps, System Administration & Tooling",
-                8: "Business Strategy & Professional Development",
-                9: "Politics, Philosophy, History & Religion",
-                10: "General Life, Education & Miscellaneous",
-                11: "Gaming & Internet Culture",
+                1: "Programming Languages & Code",
+                2: "Biology, Genetics & Molecular Science",
+                3: "Food, Nutrition & Diet",
+                4: "Computer Hardware & Electronics",
+                5: "Finance, Investing & Markets",
+                6: "DevOps, Tooling & System Administration",
+                7: "Web Platforms, Social Media & Content Creation",
+                8: "Religion, Philosophy & Literary Expression",
+                9: "Cities, Travel & Geography",
+                10: "Non english prompts",
+                11: "Gaming, Sci-Fi",
             }
             
             # Plot top journals by topic (with safer formatting)
